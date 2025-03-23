@@ -1,0 +1,20 @@
+[Unit]
+Description=Monitor Mounts, Restart Docker Services, and Notify via ntfy
+After=network-online.target local-fs.target
+Wants=network-online.target
+Documentation=man:mount(8) man:fstab(5)
+
+[Service]
+Type=simple
+ExecStart=/home/phoenix/Scripts/automountNFS.v3.0.sh
+Restart=always
+RestartSec=5s
+StartLimitIntervalSec=0
+TimeoutStartSec=300
+User=root
+ExecStartPre=/bin/bash -c "until ping -c1 10.0.0.5; do sleep 1; done"
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
