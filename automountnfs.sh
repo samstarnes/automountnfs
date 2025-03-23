@@ -7,6 +7,7 @@ exec 2> >(tee -a "${LOGFILE}" >&2)
 
 CONFIG="/etc/mounts.conf"
 FSTAB="/etc/fstab"
+FIRST_RUN_FLAG="/var/run/mount_monitor_first_run_done"
 
 # Load config
 if [[ ! -f "$CONFIG" ]]; then
@@ -18,11 +19,15 @@ fi
 NTFY=$(grep "^NTFY=" "$CONFIG" | cut -d'=' -f2)
 NTFYPORT=$(grep "^NTFYPORT=" "$CONFIG" | cut -d'=' -f2)
 CHECK_INTERVAL=$(grep "^CHECK_INTERVAL=" "$CONFIG" | cut -d'=' -f2)
+if [[ -z "$CHECK_INTERVAL" || ! "$CHECK_INTERVAL" =~ ^[0-9]+$ ]]; then
+    echo "⚠️ CHECK_INTERVAL invalid or missing, defaulting to 10"
+    CHECK_INTERVAL=10
+fi
 
 # Function to send ntfy notification
 notify() {
     local message="$1"
-    curl -d "MountMonitor: $message" "$NTFY:$NTFYPORT/automount_nfs"
+    curl -d "MountMonitor: $message" "$NTFY:$NTFYPORT/automount_nfs" 2>/dev/null
     echo "📢 Notified: $message"
 }
 
@@ -34,7 +39,7 @@ restart_services() {
         echo "🔄 Restarting services for $mountpoint: $services"
         affected_services=""
         for service in $services; do
-            sudo docker restart "$service"
+            sudo docker restart "$service" >/dev/null 2>&1
             echo "🔄 Restarted Docker service: $service"
             affected_services+="$service, "
         done
@@ -42,50 +47,62 @@ restart_services() {
     fi
 }
 
-# Update fstab, adding nofail as a fallback if not specified
-echo "🔧 Checking/Updating $FSTAB..."
-grep -v "^#" "$CONFIG" | grep -v "^NTFY" | grep -v "^CHECK_INTERVAL" | while IFS='|' read -r mountpoint source type options services; do
-    if [[ -z "$mountpoint" || "$mountpoint" == "#"* ]]; then continue; fi
-    # Add nofail if not present (fallback for safety)
-    if ! echo "$options" | grep -q "nofail"; then
-        options="$options,nofail"
-        echo "⚠️ Added nofail to $mountpoint options as a fallback"
-    fi
-    if ! grep -q "$mountpoint" "$FSTAB"; then
-        echo "$source $mountpoint $type $options 0 0" | sudo tee -a "$FSTAB"
-        echo "➕ Added $mountpoint to $FSTAB"
-    else
-        # Update existing entry if options differ
-        current_line=$(grep "$mountpoint" "$FSTAB")
-        new_line="$source $mountpoint $type $options 0 0"
-        if [[ "$current_line" != "$new_line" ]]; then
-            sudo sed -i "s|$current_line|$new_line|" "$FSTAB"
-            echo "🔄 Updated $mountpoint in $FSTAB"
+# Function to escape special characters for sed
+escape_sed() {
+    echo "$1" | sed 's/[\/|&]/\\&/g'
+}
+
+# One-time fstab sync (only on first run)
+if [[ ! -f "$FIRST_RUN_FLAG" ]]; then
+    echo "🔧 Syncing $FSTAB with $CONFIG (first run)..."
+    active_mounts=$(grep -v "^#" "$CONFIG" | grep -v "^NTFY" | grep -v "^CHECK_INTERVAL" | cut -d'|' -f1)
+    grep "^/" "$FSTAB" | while read -r line; do
+        mountpoint=$(echo "$line" | awk '{print $2}')
+        if [[ -n "$mountpoint" ]] && ! echo "$active_mounts" | grep -q "^$mountpoint$"; then
+            sudo sed -i "\|$mountpoint|d" "$FSTAB"
+            echo "🗑️ Removed $mountpoint from $FSTAB (commented out in $CONFIG)"
         fi
-    fi
-    # Ensure mountpoint directory exists
-    sudo mkdir -p "$mountpoint"
-done
+    done
 
-# Mount all drives (post-boot catch-up for unavailable drives)
-echo "⭕ Mounting all drives from $FSTAB..."
-sudo mount -a 2>/dev/null || echo "⚠️ Some mounts may have failed (nofail allows this)"
+    grep -v "^#" "$CONFIG" | grep -v "^NTFY" | grep -v "^CHECK_INTERVAL" | while IFS='|' read -r mountpoint source type options services; do
+        if [[ -z "$mountpoint" || "$mountpoint" == "#"* ]]; then continue; fi
+        if ! grep -q "$mountpoint" "$FSTAB"; then
+            echo "$source $mountpoint $type $options 0 0" | sudo tee -a "$FSTAB"
+            echo "➕ Added $mountpoint to $FSTAB"
+        else
+            current_line=$(grep "$mountpoint" "$FSTAB")
+            new_line="$source $mountpoint $type $options 0 0"
+            if [[ "$current_line" != "$new_line" ]]; then
+                escaped_current=$(escape_sed "$current_line")
+                escaped_new=$(escape_sed "$new_line")
+                sudo sed -i "s|$escaped_current|$escaped_new|" "$FSTAB"
+                echo "🔄 Updated $mountpointplaats in $FSTAB"
+            fi
+        fi
+        sudo mkdir -p "$mountpoint"
+    done
 
-# Track mount status (0 = down, 1 = up)
+    # Initial mount
+    echo "⭕ Mounting all drives from $FSTAB..."
+    sudo mount -a 2>/dev/null || echo "⚠️ Some mounts may have failed (nofail allows this)"
+
+    # Mark first run complete
+    sudo touch "$FIRST_RUN_FLAG"
+fi
+
+# Track mount status
 declare -A mount_status
 grep -v "^#" "$CONFIG" | grep -v "^NTFY" | grep -v "^CHECK_INTERVAL" | while IFS='|' read -r mountpoint source type options services; do
     if [[ -n "$mountpoint" && "$mountpoint" != "#"* ]]; then
-        mount_status["$mountpoint"]=1  # Assume initially up
+        mount_status["$mountpoint"]=$(mountpoint -q "$mountpoint" && echo 1 || echo 0)
     fi
 done
 
-# Main monitoring loop
 echo "🚀 Starting mount monitor..."
 while true; do
     grep -v "^#" "$CONFIG" | grep -v "^NTFY" | grep -v "^CHECK_INTERVAL" | while IFS='|' read -r mountpoint source type options services; do
         if [[ -z "$mountpoint" || "$mountpoint" == "#"* ]]; then continue; fi
         if mountpoint -q "$mountpoint"; then
-            # Mount is up
             if [[ "${mount_status[$mountpoint]}" -eq 0 ]]; then
                 echo "✅ $mountpoint ($source) is back online"
                 notify "$mountpoint ($source) remounted successfully"
@@ -93,15 +110,13 @@ while true; do
                 mount_status["$mountpoint"]=1
             fi
         else
-            # Mount is down
             if [[ "${mount_status[$mountpoint]}" -eq 1 ]]; then
                 echo "❌ $mountpoint ($source) is offline"
                 notify "$mountpoint ($source) lost connection"
                 mount_status["$mountpoint"]=0
             fi
-            # Attempt remount
-            sudo mount "$mountpoint" 2>/dev/null || echo "⚠️  Failed to remount $mountpoint (may be unavailable)"
+            sudo mount "$mountpoint" 2>/dev/null || true
         fi
     done
-    sleep "$CHECK_INTERVAL"
+    sleep "$CHECK_INTERVAL" || { echo "❌ Sleep failed, exiting"; exit 1; }
 done
